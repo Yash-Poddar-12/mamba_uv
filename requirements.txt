@@ -1,0 +1,25 @@
+# ---- Core ----
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24
+pyyaml>=6.0
+tqdm>=4.66
+
+# ---- Data ----
+datasets>=2.19.0          # HuggingFace datasets, used to pull taufiktrf/AQUA20
+huggingface_hub>=0.23.0
+pillow>=10.0
+scikit-learn>=1.3          # StratifiedKFold, classification_report, confusion_matrix
+
+# ---- Metrics / logging ----
+tensorboard>=2.15
+matplotlib>=3.8            # confusion matrix plotting
+
+# ---- Optional: real CUDA-accelerated Mamba kernels (Linux/WSL2 + NVCC only) ----
+# Leave these commented out until you've read the README's mamba-ssm section.
+# causal-conv1d>=1.4.0
+# mamba-ssm>=2.2.0
+
+# ---- Optional: only needed if you run src/data/synthetic_augment_openai.py ----
+# openai>=1.30.0
+# python-dotenv>=1.0.0
