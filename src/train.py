@@ -70,7 +70,8 @@ def train_one_fold(cfg: dict, fold, fold_idx: int, device: torch.device) -> dict
     scheduler = build_scheduler(
         optimizer, cfg["train"]["warmup_epochs"], cfg["train"]["epochs"], len(fold.train_loader)
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg["train"]["mixed_precision"] and device.type == "cuda")
+    use_amp = cfg["train"]["mixed_precision"] and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     scan_inv_frac = cfg["losses"]["scan_invariance_shuffle_frac"] \
         if cfg["losses"]["use_scan_invariance_loss"] else 0.0
@@ -79,16 +80,30 @@ def train_one_fold(cfg: dict, fold, fold_idx: int, device: torch.device) -> dict
     os.makedirs(ckpt_dir, exist_ok=True)
     writer = SummaryWriter(os.path.join(cfg["train"]["log_dir"], f"fold_{fold_idx}"))
 
-    best_f1, patience_counter, global_step = -1.0, 0, 0
+    resume_path = os.path.join(ckpt_dir, "last_checkpoint.pt")
+    start_epoch, best_f1, patience_counter, global_step = 0, -1.0, 0, 0
 
-    for epoch in range(cfg["train"]["epochs"]):
+    if os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_f1 = ckpt["best_f1"]
+        patience_counter = ckpt["patience_counter"]
+        global_step = ckpt["global_step"]
+        print(f"[Fold {fold_idx}] Resuming from checkpoint: epoch {start_epoch}, "
+              f"best_f1 so far = {best_f1:.4f}")
+
+    for epoch in range(start_epoch, cfg["train"]["epochs"]):
         model.train()
         pbar = tqdm(fold.train_loader, desc=f"Fold {fold_idx} | Epoch {epoch + 1}/{cfg['train']['epochs']}")
         for imgs, targets in pbar:
             imgs, targets = imgs.to(device), targets.to(device)
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=cfg["train"]["mixed_precision"] and device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 logits, aux = model(imgs, return_aux=True, scan_invariance_shuffle_frac=scan_inv_frac)
                 loss, logs = criterion(logits, targets, aux)
 
@@ -111,6 +126,7 @@ def train_one_fold(cfg: dict, fold, fold_idx: int, device: torch.device) -> dict
               f"val_f1={val_metrics['f1_macro']:.4f} val_top1={val_metrics['top1_acc']:.4f} "
               f"val_top3={val_metrics['top3_acc']:.4f}")
 
+        stop_early = False
         if val_metrics["f1_macro"] > best_f1:
             best_f1 = val_metrics["f1_macro"]
             patience_counter = 0
@@ -119,7 +135,24 @@ def train_one_fold(cfg: dict, fold, fold_idx: int, device: torch.device) -> dict
             patience_counter += 1
             if patience_counter >= cfg["train"]["early_stopping_patience"]:
                 print(f"[Fold {fold_idx}] Early stopping at epoch {epoch + 1}")
-                break
+                stop_early = True
+
+        # Full training-state checkpoint, saved every epoch regardless of
+        # whether it was the best -- lets an interrupted run (reboot, sleep,
+        # crash) resume from here instead of restarting from epoch 0.
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "best_f1": best_f1,
+            "patience_counter": patience_counter,
+            "global_step": global_step,
+        }, resume_path)
+
+        if stop_early:
+            break
 
     writer.close()
     model.load_state_dict(torch.load(os.path.join(ckpt_dir, "best.pt"), map_location=device))
