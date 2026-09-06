@@ -2,20 +2,26 @@
 # Mamba-UV configuration
 # Edit values here rather than hardcoding inside scripts.
 # ============================================================
+
 data:
   source: "local" # "huggingface" (default, auto-downloads) or "local"
   local_root: "D:/GOVT_UNDERWATER_2026/Datasets/AQUA20-20260829T041232Z-1-001/AQUA20"
   hf_dataset_id: "taufiktrf/AQUA20" # unused when source == "local"
   image_size: 224 # must be divisible by patch_size
-  patch_size: 32 # DEBUG: was 16 -> 49 tokens instead of 196, much faster
+  patch_size: 16
   num_classes: 20
-  mode: "holdout"
+  mode:
+    "holdout" # "holdout" -> official train/test split
+    # "kfold"   -> merge train+test, 5-fold stratified CV
   k_folds: 5
-  val_fraction: 0.1
+  val_fraction: 0.1 # only used in "holdout" mode (carved out of the official train split)
   num_workers: 4
   batch_size: 32
   seed: 42
+  # optional: path to a folder of synthetic images produced by
+  # src/data/synthetic_augment_openai.py, laid out as <root>/<class_name>/*.jpg
   synthetic_data_dir: null
+
 augmentation:
   horizontal_flip_p: 0.5
   rotation_degrees: 20
@@ -30,12 +36,14 @@ augmentation:
   minority_boost_threshold: 0.3
   minority_extra_rotation_degrees: 35
   minority_random_erasing_p: 0.25
+
 imbalance:
   use_class_weighted_loss: true # inverse-frequency weights fed into CrossEntropyLoss
   use_weighted_sampler: true # WeightedRandomSampler oversampling minority classes
   loss_type: "ce_ls" # "ce_ls" (label-smoothed CE, paper default) or "focal"
   label_smoothing: 0.1
   focal_gamma: 2.0 # only used if loss_type == "focal"
+
 model:
   d_model: 96
   d_state: 16
@@ -44,16 +52,18 @@ model:
   n_blocks: 4
   mlp_ratio: 4
   # ---- ablation switches (section 3.7 of the methodology) ----
-  use_physics_order: false # DEBUG: was true
-  use_register_tokens: false # DEBUG: was true
-  use_idwp: false # DEBUG: was true -- plain mean pooling
+  use_physics_order: true
+  use_register_tokens: true
+  use_idwp: true # inverse-degradation weighted pooling
   local_perturb_frac: 0.15 # token perturbation during training (robustness)
+
 losses:
-  use_physics_consistency_loss: false # DEBUG: was true
+  use_physics_consistency_loss: true
   lambda_physics: 0.1
-  use_scan_invariance_loss: false # DEBUG: was true
+  use_scan_invariance_loss: true
   lambda_scan_invariance: 0.05
   scan_invariance_shuffle_frac: 0.4
+
 train:
   epochs: 60
   lr: 0.0003
@@ -64,6 +74,7 @@ train:
   early_stopping_patience: 12
   checkpoint_dir: "checkpoints"
   log_dir: "runs"
+
 mamba_backend:
   prefer_mamba_ssm:
     true # try the official CUDA kernel first, fall back to

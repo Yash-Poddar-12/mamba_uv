@@ -38,11 +38,29 @@ class NaiveSelectiveSSM(nn.Module):
         )
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.d_state, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        self._init_dt_proj()
 
         A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def _init_dt_proj(self, dt_scale: float = 1.0, dt_min: float = 1e-3,
+                       dt_max: float = 1e-1, dt_init_floor: float = 1e-4):
+        """Matches mamba_ssm's dt_proj init. Without this, delta (the
+        per-token 'how much to trust this token vs. accumulated memory'
+        gate) starts at an arbitrary scale, which slows early convergence
+        regardless of whether physics-ordering is on -- this fixes that,
+        it does not change what the ordering does."""
+        dt_init_std = self.dt_rank ** -0.5 * dt_scale
+        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))  # inverse of softplus
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
 
     def _selective_scan(self, x, delta, A, Bm, Cm):
         # x, delta: (B, L, d_inner); A: (d_inner, d_state); Bm, Cm: (B, L, d_state)
