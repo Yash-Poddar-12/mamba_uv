@@ -4,12 +4,14 @@
 # ============================================================
 
 data:
-  source: "local" # "huggingface" (default, auto-downloads) or "local"
-  local_root: "D:/GOVT_UNDERWATER_2026/Datasets/AQUA20-20260829T041232Z-1-001/AQUA20"
+  source: "flat" # "huggingface" (auto-downloads) | "local" (train/ + test/ folders) | "flat" (<root>/<class>/*.jpg, split done in code)
+  flat_root: "C:/Users/Ant pc/Downloads/final_dataset/images/default/.data_merged"
+  test_fraction: 0.15 # "flat" only: per-class share held out as the test set (val is carved from the rest via val_fraction)
+  local_root: "D:/GOVT_UNDERWATER_2026/Datasets/AQUA20-20260829T041232Z-1-001/AQUA20" # only for source == "local"
   hf_dataset_id: "taufiktrf/AQUA20" # unused when source == "local"
   image_size: 224 # must be divisible by patch_size
   patch_size: 16
-  num_classes: 20
+  num_classes: 20 # ignored: overwritten at load time with the number of class folders found
   mode:
     "holdout" # "holdout" -> official train/test split
     # "kfold"   -> merge train+test, 5-fold stratified CV

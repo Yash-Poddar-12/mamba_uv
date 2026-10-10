@@ -14,18 +14,25 @@ physically meaningful pixel intensities (channel ratios, dark-channel
 minima) -- shifting/scaling those with ImageNet-style normalization would
 corrupt the physics signal it computes.
 """
+import os
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from datasets import load_dataset, concatenate_datasets, DatasetDict
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torchvision.datasets.folder import default_loader
+
+# scraped / iNaturalist downloads occasionally contain truncated files --
+# load what's there instead of crashing a DataLoader worker mid-epoch
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 from src.data.class_balance import (
     compute_class_weights,
@@ -134,7 +141,11 @@ class LocalFolderImageDataset(Dataset):
     def __getitem__(self, i: int):
         idx = self.indices[i]
         path, label = self.samples[idx]
-        img = default_loader(path)  # PIL, already RGB
+        try:
+            img = default_loader(path)  # PIL, already RGB (handles RGBA/L/P PNGs)
+        except Exception as e:  # corrupt file -> use the next sample instead of crashing
+            print(f"[WARN] unreadable image skipped: {path} ({e})")
+            return self.__getitem__((i + 1) % len(self))
         if self.minority_mask is not None and self.minority_mask[i] and self.minority_transform is not None:
             img_t = self.minority_transform(img)
         else:
@@ -193,6 +204,77 @@ def _loader(dataset: Dataset, cfg, shuffle: bool, sampler=None) -> DataLoader:
     )
 
 
+
+# ----------------------------------------------------------------------
+# Flat <root>/<class_name>/*.jpg|png layout (no train/test split on disk)
+# ----------------------------------------------------------------------
+def _safe_stratified_split(labels, frac: float, seed: int):
+    """Per-class split that never crashes on tiny classes.
+    Returns (keep_idx, held_idx), both sorted index arrays into `labels`.
+    - class with >= 2 samples: at least 1 sample in each side
+    - class with 1 sample: stays entirely in keep_idx"""
+    rng = np.random.RandomState(seed)
+    labels = np.asarray(labels)
+    keep, held = [], []
+    for c in np.unique(labels):
+        idx = np.where(labels == c)[0]
+        rng.shuffle(idx)
+        n = len(idx)
+        if n < 2:
+            keep.extend(idx.tolist())
+            continue
+        n_held = min(max(int(round(n * frac)), 1), n - 1)
+        held.extend(idx[:n_held].tolist())
+        keep.extend(idx[n_held:].tolist())
+    return np.array(sorted(keep), dtype=np.int64), np.array(sorted(held), dtype=np.int64)
+
+
+def _holdout_split(labels, frac: float, seed: int):
+    """sklearn's stratified split when it is possible (keeps the original
+    AQUA20 behaviour identical); per-class fallback when some class is too
+    small for sklearn (needs >= 2 samples per class)."""
+    labels = np.asarray(labels)
+    idx = np.arange(len(labels))
+    try:
+        return train_test_split(idx, test_size=frac, stratify=labels, random_state=seed)
+    except ValueError:
+        print("[data] a class has < 2 train samples -> using per-class safe split for val")
+        return _safe_stratified_split(labels, frac, seed)
+
+
+def _scan_flat_folder(root: str):
+    """Scan <root>/<class_name>/<image files>. Returns (class_names, samples)
+    with samples = [(path, label_id), ...]. Class order is alphabetical, so
+    label ids are stable between train.py and evaluate.py."""
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"data.flat_root does not exist: {root}")
+    class_dirs = sorted(e.name for e in os.scandir(root) if e.is_dir())
+    class_names: List[str] = []
+    samples: List[tuple] = []
+    empty = []
+    for name in class_dirs:
+        cdir = os.path.join(root, name)
+        files = sorted(f for f in os.listdir(cdir)
+                       if os.path.splitext(f)[1].lower() in IMG_EXTS)
+        if not files:
+            empty.append(name)
+            continue
+        label = len(class_names)
+        class_names.append(name)
+        samples.extend((os.path.join(cdir, f), label) for f in files)
+    if empty:
+        print(f"[data] skipped {len(empty)} class folder(s) with no images: {empty}")
+
+    counts = np.bincount([l for _, l in samples], minlength=len(class_names))
+    order = np.argsort(counts)
+    print(f"[data] flat dataset: {len(class_names)} classes, {len(samples)} images | "
+          f"per-class min/median/max = {counts.min()}/{int(np.median(counts))}/{counts.max()} | "
+          f"classes with <10 images: {int((counts < 10).sum())}")
+    print("[data] 8 smallest classes: " +
+          ", ".join(f"{class_names[i]}({counts[i]})" for i in order[:8]))
+    return class_names, samples
+
+
 def _load_pool(cfg):
     """Returns (class_names, train_pool, test_pool, kind) where kind is
     'hf' or 'local' and each pool is the object build_folds' dataset
@@ -210,13 +292,24 @@ def _load_pool(cfg):
         )
         return train_folder.classes, train_folder.samples, test_folder.samples, "local"
 
+    elif source == "flat":
+        class_names, samples = _scan_flat_folder(cfg["data"]["flat_root"])
+        labels = np.array([l for _, l in samples])
+        trainval_idx, test_idx = _safe_stratified_split(
+            labels, cfg["data"].get("test_fraction", 0.15), cfg["data"]["seed"]
+        )
+        train_pool = [samples[i] for i in trainval_idx]
+        test_pool = [samples[i] for i in test_idx]
+        print(f"[data] split -> train+val: {len(train_pool)} | test: {len(test_pool)}")
+        return class_names, train_pool, test_pool, "local"
+
     elif source == "huggingface":
         ds: DatasetDict = load_dataset(cfg["data"]["hf_dataset_id"])
         class_names = ds["train"].features["label"].names
         return class_names, ds["train"], ds["test"], "hf"
 
     else:
-        raise ValueError(f"Unknown data.source: {source!r} (use 'huggingface' or 'local')")
+        raise ValueError(f"Unknown data.source: {source!r} (use 'huggingface', 'local' or 'flat')")
 
 
 def _make_dataset(kind, pool, indices, transform, minority_mask=None, minority_transform=None):
@@ -241,8 +334,14 @@ def build_folds(cfg) -> List[Fold]:
     """Returns a list with a single Fold for mode == 'holdout', or
     cfg.data.k_folds Folds for mode == 'kfold'."""
     seed = cfg["data"]["seed"]
-    num_classes = cfg["data"]["num_classes"]
     class_names, train_pool, test_pool, kind = _load_pool(cfg)
+    # num_classes always follows the data on disk; the model head and the
+    # loss read cfg["data"]["num_classes"], so overwrite it here.
+    num_classes = len(class_names)
+    if cfg["data"].get("num_classes") != num_classes:
+        print(f"[data] num_classes: config said {cfg['data'].get('num_classes')}, "
+              f"data has {num_classes} -> using {num_classes}")
+    cfg["data"]["num_classes"] = num_classes
 
     train_tf, minority_tf, eval_tf = build_transforms(cfg)
     threshold = cfg["augmentation"]["minority_boost_threshold"]
@@ -252,12 +351,7 @@ def build_folds(cfg) -> List[Fold]:
     if cfg["data"]["mode"] == "holdout":
         all_labels = _pool_labels(kind, train_pool)
         all_idx = np.arange(len(all_labels))
-        train_idx, val_idx = train_test_split(
-            all_idx,
-            test_size=cfg["data"]["val_fraction"],
-            stratify=all_labels,
-            random_state=seed,
-        )
+        train_idx, val_idx = _holdout_split(all_labels, cfg["data"]["val_fraction"], seed)
 
         train_labels_subset = all_labels[train_idx]
         minority_mask = minority_mask_from_counts(train_labels_subset, num_classes, threshold)
